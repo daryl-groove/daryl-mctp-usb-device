@@ -23,19 +23,22 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
 - **Next actions (prioritised), for a fresh session:**
   - ~~**P0 — close step-5**~~ **DONE** (2026-06-24): `mctpusbd` enumerates as
     `1d6b:0104` and answers all 4 control commands on aspeed-2700. Step-5 closed.
-  - **P1 — ratify the engine decision** (standalone vs libmctp-core), best via a
-    small **spike: a libmctp FunctionFS/gadget binding** (reuse `usb.c`'s DSP0283
-    framing, swap libusb I/O for ep read/write). It decides the engine with evidence
-    AND is the foundation for the demux/pldmd north star. Higher leverage than doing
-    the router on standalone (which a core switch would redo).
-  - **P1.5 — cheap research that can change the route:** (a) does the target `pldmd`
-    build still support the demux socket? (b) has a device/gadget-side in-kernel
-    MCTP-USB driver landed in mainline? (the load-bearing wall).
-  - **P2 (gated on P1):** the demux + pldmd integration (mctpusbd = device-side
-    demux + reassembly; pldmd = PLDM provider) — see the Future section.
-  - **Parallel track:** host side off libmctp → kernel `mctp-usb` + AF_MCTP + pldmd
-    requester (independent; kernel already supports the host side).
-  - **Deferred:** Tier-1 `--vid/--pid/--serial`; the router seam (gated on P1).
+  - **Step A — message type router** (standalone engine, ~5 lines in
+    `mctp_endpoint.cpp`): dispatch on `body[0] & 0x7F`; type 0x00 → existing
+    `mctpctrl::handle`; other types → placeholder drop. Verify: type `0x7F` raw frame
+    received without crashing; all 4 control commands still pass.
+  - **Step B — libmctp-core FunctionFS binding** (P1 spike → full): new
+    `mctp_core_binding.{hpp,cpp}`; FunctionFS send/recv callbacks; router from Step A
+    wired to `mctp_set_rx_all`. Gate: 4 control commands pass on aspeed-2700 via
+    libmctp-core engine (step-5 baseline holds).
+  - **Step C — demux socket server + pldmd** (gated on B): read
+    `libpldm/transport/mctp-demux.c` first to pin dialect; implement server; wire type
+    0x01 → pldmd; build pldmd with `mctp-demux`; end-to-end PLDM command round-trip.
+    Update `GetMessageTypeSupport` to `[0x00, 0x01]` **last**.
+  - Full plan in [`PLAN-path-a.md`](./PLAN-path-a.md).
+  - **Pre-implementation research** (before Step B/C): pin libpldm demux dialect;
+    decide libmctp fork (openbmc vs NVIDIA); confirm version compatibility with pldmd.
+  - **Deferred:** Tier-1 `--vid/--pid/--serial`; parallel host-side track.
 
 ## Next phase: libusbgx migration — steps 1–4 DONE, step 5 (guest verify) pending
 
@@ -207,6 +210,11 @@ Host side is independent and already supported: host = kernel `mctp-usb` host dr
 → AF_MCTP → pldmd as requester, **no libmctp needed** (planned direction). Only the
 device/gadget side lacks kernel support.
 
+**Kernel status confirmed (2026-06-24, web search):** Linux 6.15 merged the host-side
+`mctp-usb` driver (`drivers/net/mctp/mctp-usb.c`, by CodeConstruct). The driver page
+makes **no mention of a gadget/device-side counterpart** — the wall remains. AF_MCTP
+on the device side is not possible today.
+
 ### Device libmctp-core vs host kernel stack are orthogonal — no conflict (2026-06-24)
 
 Concern raised: the future box is **both a USB host** (downstream, to other MCTP-USB
@@ -290,6 +298,32 @@ Don't copy: the MCTP-control `tx_pvt_message` path (per-bus private-binding head
 PCIe/SPI/I2C/USB EID offsets) is bus-owner/host-flavoured; our device answers control
 (type 0x00) **in-process**, not by forwarding. And confirm the socket dialect against the
 actual pldmd build (the same demux-support one-vote-veto noted above).
+
+### Path A + libmctp-core + spike are one line (2026-06-24)
+
+Path A (architecture), libmctp-core (implementation tool), and the P1 spike (validation)
+are not three separate decisions — they form a single implementation path:
+
+- **Path A** = mctpusbd acts as the device-side demux server; pldmd connects as a client
+  via mctp-demux transport. Chosen over **Path C** (link libpldm in-process) because
+  `libpldmresponder` (D-Bus → PLDM sensor/FRU/PDR) is the valuable part pldmd already
+  provides; Path C would require reimplementing exactly that, negating the reuse benefit.
+- **libmctp-core** = the implementation tool that makes Path A tractable: reassembly /
+  fragmentation are free, and the NVIDIA demux daemon's socket-server half is directly
+  referenceable. Without it, reassembly is ours to hand-roll (error-prone).
+- **P1 spike** = validates that the FunctionFS/gadget binding (the one piece libmctp-core
+  does *not* provide) has no unexpected friction — bounded work, but unproven.
+
+The three parts together: **libmctp-core + FunctionFS binding (①, spike target) +
+demux socket server half (③, reference from NVIDIA daemon) = Path A implementation.**
+Reassembly (②) is free from libmctp-core.
+
+**pldmd analysis (2026-06-24):** phosphor-pldm supports both `mctp-demux` and `af-mctp`
+transports, selected at compile time via `transport-implementation` (no default — must be
+set in the build recipe). The demux dialect is abstracted inside `libpldm`'s
+`pldm_transport_mctp_demux_init()` — we need to read `libpldm/transport/mctp-demux.c` to
+pin the wire protocol before implementing the server side. pldmd's responder role is
+passive (no EID assignment, reads host EID from config) → compatible with device-side use.
 
 ### Conditional preferred shape (leaning, to ratify after step-5) — 2026-06-24
 
@@ -435,6 +469,40 @@ shortcut a fuller implementation would tighten; the other two are correct as-is.
 ## Session log
 
 > Append newest entries at the top. Format: `### YYYY-MM-DD — summary`
+
+### 2026-06-24 — Path A design fleshed out; PLAN-path-a.md created
+- **PLDM = type 0x01 MCTP message**: same mechanism as any raw custom payload; only
+  difference is the type byte. Current mctpusbd drops all non-0x00 types at
+  `mctpctrl::handle` line 61 — PLDM is equally unreachable today.
+- **Router is the missing seam**: `mctpep::process` needs a dispatch on `body[0] & 0x7F`
+  before calling any handler. This is the exact seam described in PROGRESS.md §Future;
+  now unblocked (step-5 baseline locked).
+- **No separate binary for "simple" mctpusbd**: the router design means mctpusbd
+  naturally runs in control-only mode when pldmd is absent — same binary, different
+  operational state. Contrast with `ffsd` (kept because it uniquely isolates FunctionFS
+  from libusbgx; no equivalent unique role for a simple mctpusbd variant).
+- **Implementation order**: Step A (router, ~5 lines) → Step B (libmctp-core binding,
+  P1 spike) → Step C (demux socket server + pldmd). `GetMessageTypeSupport` updated to
+  `[0x00, 0x01]` only at the end of Step C — never advertise before we can deliver.
+- **Created [`PLAN-path-a.md`](./PLAN-path-a.md)**: full design, step breakdown,
+  decision log, pre-implementation research checklist.
+
+### 2026-06-24 — direction ratified: Path A + libmctp-core + P1 spike
+- **af-mctp device-side wall confirmed** via web search: Linux 6.15 merged host-side
+  `mctp-usb` (CodeConstruct); no gadget-side driver exists or is mentioned. Device side
+  stays userspace FunctionFS for the foreseeable future.
+- **pldmd analysed** (`/home/daryl/work/project/dep/pldm`): supports both `mctp-demux`
+  and `af-mctp` at compile time (recipe choice); responder role is passive endpoint —
+  compatible with device-side use. Demux dialect lives in `libpldm/transport/mctp-demux.c`
+  (not pldmd itself) — need to read that before implementing server side.
+- **Path A confirmed over Path C**: Path C (link libpldm in-process) would require
+  reimplementing `libpldmresponder` (D-Bus → PLDM), which is exactly what pldmd already
+  provides — bad trade. Path A reuses pldmd wholesale; only adds demux server in mctpusbd.
+- **Unified picture**: Path A + libmctp-core + P1 spike are one line. libmctp-core gives
+  reassembly free; NVIDIA demux daemon gives socket-half reference; spike validates the
+  FunctionFS binding (the only unproven piece). See new "Path A + libmctp-core" section.
+- next: P1 spike — wire Get EID through libmctp-core + FunctionFS binding; read
+  `libpldm/transport/mctp-demux.c` to pin the demux wire protocol.
 
 ### 2026-06-24 — step-5 CLOSED: mctpusbd end-to-end verified on aspeed-2700
 - confirmed on aspeed-2700 QEMU guest: `lsusb` shows `1d6b:0104 daryl MCTP FFS device`

@@ -16,8 +16,21 @@ std::vector<std::uint8_t> process(mctpctrl::EndpointState &state,
 	if (packet.error != mctppkt::ParseError::Ok)
 		return {};
 
-	const std::vector<std::uint8_t> reply =
-		mctpctrl::handle(state, packet.body);
+	// Dispatch on message type. Unrecognised types are dropped here; new
+	// handlers (e.g. PLDM type 0x01) slot in as additional cases.
+	const std::uint8_t msg_type =
+		packet.body.empty() ? 0xff
+				    : (packet.body[0] & mctpctrl::MsgTypeMask);
+
+	std::vector<std::uint8_t> reply;
+	switch (msg_type) {
+	case mctpctrl::MsgTypeControl:
+		reply = mctpctrl::handle(state, packet.body);
+		break;
+	default:
+		return {};
+	}
+
 	if (reply.empty())
 		return {};
 
