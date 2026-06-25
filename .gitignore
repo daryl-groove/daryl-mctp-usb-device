@@ -1,0 +1,8 @@
+/build/
+/build-sdk/
+/build-cross/
+*.err
+*-setup.log
+# meson clones wrap-git subprojects here; the .wrap file is the source of truth
+/subprojects/libmctp/
+/subprojects/*.wrap.hash

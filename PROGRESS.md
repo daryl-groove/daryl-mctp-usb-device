@@ -470,6 +470,32 @@ shortcut a fuller implementation would tighten; the other two are correct as-is.
 
 > Append newest entries at the top. Format: `### YYYY-MM-DD — summary`
 
+### 2026-06-24 — Step B: libmctp-core FunctionFS binding implemented; cross build + 22 tests OK
+- **Step B complete (build + unit-test gate passed)**:
+  - `subprojects/libmctp.wrap` + `subprojects/packagefiles/libmctp/meson.build` — wraps the
+    NVIDIA fork's core (alloc.c + core.c + log.c only; no json-c / systemd / libusb); statically
+    linked into mctpusbd. daryl SDK (aarch64) has no system libmctp, so the subproject fallback
+    always fires.
+  - `mctp/mctp_core_binding.{hpp,cpp}` — `mctpcore::FfsBinding` class: `recv_frame()` strips the
+    DSP0283 USB header, feeds the MCTP packet to `mctp_bus_rx`, libmctp reassembles and calls
+    `rx_all_cb`; `tx_cb` prepends the USB header and writes to ep-IN (ep2). EID is re-registered
+    via `mctp_unregister_bus` + `mctp_register_bus` after Set EID so libmctp accepts packets to
+    the new EID. Type 0x00 → `mctpctrl::handle`; other types dropped (PLDM handler = Step C).
+  - `ffs/ffs_daemon.{hpp,cpp}` — added optional `FrameProcessor` parameter to `ffs_serve`;
+    `ffsd` passes nothing (keeps standalone trace path unchanged); `mctpusbd` passes a lambda
+    that lazily constructs `FfsBinding` on the first frame after ENABLE (ep_in_fd known then).
+  - `meson.build` — `dependency('libmctp', fallback: ['libmctp', 'libmctp_dep'])` +
+    `mctp/mctp_core_binding.cpp` in mctpusbd sources.
+- **Compatibility note**: SDK libmctp (openbmc 0.11) `mctp_rx_fn` parameter order is
+  `(src_eid, tag_owner, msg_tag, **data**, msg, len)` — `data` (user context) is 4th, before
+  `msg`. NVIDIA fork reverses `data`/`msg`. Implementation matches the SDK's order.
+- **cross-build + 22/22 gtest tests pass** under qemu-aarch64 (daryl SDK, Cortex-A57). libmctp
+  statically linked into mctpusbd (no new .so NEEDED on target). No new warnings.
+- **Gate to Step C (hardware)**: deploy build-sdk/mctpusbd to aspeed-2700; confirm all 4 control
+  commands (Set EID, Get EID, Get UUID, Get Msg Type) still pass through the libmctp-core engine.
+- **next**: Step C — demux socket server + pldmd integration (gated on hardware verify of Step B).
+  Before that: read `libpldm/transport/mctp-demux.c` to pin the exact wire protocol.
+
 ### 2026-06-24 — Path A design fleshed out; PLAN-path-a.md created
 - **PLDM = type 0x01 MCTP message**: same mechanism as any raw custom payload; only
   difference is the type byte. Current mctpusbd drops all non-0x00 types at

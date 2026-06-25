@@ -14,6 +14,14 @@ project(
 # the include path so every source keeps unprefixed includes.
 engine_inc = include_directories('mctp', 'ffs')
 
+# libmctp-core (Step B): provides reassembly/fragmentation for mctpusbd.
+# Try system pkg-config first; fall back to the subprojects/ wrap (NVIDIA fork,
+# compiled from source with a minimal core-only meson.build overlay).
+libmctp_dep = dependency('libmctp',
+    required: false,
+    fallback: ['libmctp', 'libmctp_dep'],
+)
+
 # The MCTP engine — pure, fully unit-tested off-target.
 mctp_engine = files(
     'mctp/mctp_endpoint.cpp',
@@ -40,9 +48,9 @@ executable(
 libusbgx_dep = dependency('libusbgx')
 executable(
     'mctpusbd',
-    ['app/mctpusbd.cpp'] + ffs_core,
+    ['app/mctpusbd.cpp', 'mctp/mctp_core_binding.cpp'] + ffs_core,
     include_directories: engine_inc,
-    dependencies: [libusbgx_dep],
+    dependencies: [libusbgx_dep, libmctp_dep],
     install: false,
 )
 

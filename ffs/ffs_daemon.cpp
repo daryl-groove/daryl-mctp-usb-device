@@ -84,6 +84,7 @@ struct Context {
 	Fd epIn;		      // ep2, device -> host (we write)
 	int mpsIn = 0;		      // ep2 wMaxPacketSize, for ZLP decisions
 	mctpctrl::EndpointState state; // MCTP endpoint state (EID etc.)
+	FrameProcessor frame_proc;     // optional override for MCTP data path
 };
 
 enum class Ep0Status { Continue, Closed, Error };
@@ -217,6 +218,15 @@ void handle_out(Context &ctx)
 		return;
 	}
 
+	// Optional core-binding path (Step B): the caller supplies its own
+	// frame processor (e.g. mctpcore::FfsBinding) and writes the reply
+	// directly to ep_in_fd.  The standalone trace path below is kept for
+	// ffsd (debug tool) which passes no processor.
+	if (ctx.frame_proc) {
+		ctx.frame_proc(in, ctx.epIn.get(), ctx.mpsIn);
+		return;
+	}
+
 	trace("RX", in);
 	const std::vector<std::uint8_t> reply = mctpep::process(ctx.state, in);
 	if (reply.empty()) {
@@ -309,11 +319,12 @@ Ep0Status handle_ep0(int ep0, Context &ctx)
 } // namespace
 
 int ffs_serve(const std::string &mount, Mode mode,
-	      const std::function<bool()> &on_ready)
+	      const std::function<bool()> &on_ready, FrameProcessor on_frame)
 {
 	Context ctx;
 	ctx.mount = mount;
 	ctx.mode = mode;
+	ctx.frame_proc = std::move(on_frame);
 
 	Fd ep0(::open((mount + "/ep0").c_str(), O_RDWR));
 	if (!ep0.valid()) {

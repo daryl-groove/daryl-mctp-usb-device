@@ -16,11 +16,14 @@
 // This is the binary intended for systemd on real hardware (e.g. aspeed-vhub).
 
 #include "ffs_daemon.hpp"
+#include "mctp_control.hpp"
+#include "mctp_core_binding.hpp"
 
 #include <csignal>
 #include <cstring>
 #include <format>
 #include <iostream>
+#include <memory>
 #include <string>
 
 #include <sys/mount.h>
@@ -108,6 +111,33 @@ int main(int argc, char **argv)
 
 	install_signal_handlers();
 
+	// libmctp-core binding (Step B): constructed lazily on the first received
+	// frame after ENABLE (ep_in_fd and mps_in are only known then).
+	// The binding owns its own EndpointState; ffs_daemon's internal state is
+	// bypassed when a FrameProcessor is installed.
+	mctpctrl::EndpointState core_state;
+	std::unique_ptr<mctpcore::FfsBinding> core_binding;
+	int last_ep_in_fd = -1;
+
+	// Build the FrameProcessor only for Mctp mode (Echo is handled before
+	// the processor hook in ffs_daemon, so it never calls this lambda).
+	ffsd::FrameProcessor frame_proc;
+	if (opt.mode == ffsd::Mode::Mctp) {
+		frame_proc = [&core_binding, &core_state,
+			      &last_ep_in_fd](std::span<const std::uint8_t> frame,
+					      int ep_in_fd, int mps_in) {
+			// Re-create the binding on each new ENABLE (detected by a
+			// different ep_in_fd) so stale fds are never reused.
+			if (!core_binding || last_ep_in_fd != ep_in_fd) {
+				core_binding =
+				    std::make_unique<mctpcore::FfsBinding>(
+					ep_in_fd, core_state, mps_in);
+				last_ep_in_fd = ep_in_fd;
+			}
+			core_binding->recv_frame(frame);
+		};
+	}
+
 	usbg_state *s = nullptr;
 	if (!usbg_ok(usbg_init(ConfigfsPath, &s), "usbg_init"))
 		return 1;
@@ -167,6 +197,7 @@ int main(int argc, char **argv)
 	// Run the shared event loop. on_ready enables the UDC once ffs_serve has
 	// written the descriptors — the order the gadget framework requires.
 	rc = ffsd::ffs_serve(opt.mount, opt.mode, [&]() -> bool {
+		// on_ready: enable UDC once descriptors are written
 		usbg_udc *udc = nullptr;
 		if (!opt.udc.empty()) {
 			udc = usbg_get_udc(s, opt.udc.c_str());
@@ -182,7 +213,7 @@ int main(int argc, char **argv)
 			"UDC bound ({}); enumerating\n",
 			opt.udc.empty() ? "auto" : opt.udc.c_str());
 		return true;
-	});
+	}, std::move(frame_proc));
 
 cleanup:
 	// Undo in reverse: clear the UDC, unmount, then remove the gadget.

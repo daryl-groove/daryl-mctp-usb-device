@@ -1,0 +1,7 @@
+[wrap-git]
+url = /home/daryl/work/project/dep/libmctp
+revision = HEAD
+patch_directory = libmctp
+
+[provide]
+libmctp = libmctp_dep

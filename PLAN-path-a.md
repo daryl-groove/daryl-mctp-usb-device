@@ -103,20 +103,23 @@ any libmctp-core complexity.
 **Gate to Step B:** router receives non-0x00 type without crashing; control path (type
 0x00) still passes all 4 commands.
 
-### Step B — libmctp-core FunctionFS binding (P1 spike → full binding)
+### Step B — libmctp-core FunctionFS binding (P1 spike → full binding) ✓ build done
 
-**Scope:** new `mctp/mctp_core_binding.{hpp,cpp}` (or similar). Replaces the
-`mctp_packet` + `mctp_endpoint` standalone path with libmctp-core as the engine.
-`mctpctrl::handle` stays; it becomes the type-0x00 handler registered via
-`mctp_set_rx_all` (or a type-specific callback if the core supports it).
+**Scope:** `mctp/mctp_core_binding.{hpp,cpp}` (new). Replaces the `mctp_packet` +
+`mctp_endpoint` standalone path in mctpusbd with libmctp-core as the engine.
+`mctpctrl::handle` stays as the type-0x00 handler registered via `mctp_set_rx_all`.
 
 Sub-steps:
-1. Add libmctp as a meson subproject (`.wrap` → openbmc/libmctp or NVIDIA fork — decide
-   which based on what pldmd's libpldm expects).
-2. Write the FunctionFS binding: `send` callback = write ep1 (IN); `recv` loop = read
-   ep2 (OUT) → `mctp_input()`.
-3. Wire `mctp_set_rx_all` to the router from Step A.
-4. Verify: all 4 control commands still work through libmctp-core.
+1. [x] Add libmctp as a meson subproject — NVIDIA fork via `subprojects/libmctp.wrap` +
+   `subprojects/packagefiles/libmctp/meson.build` (core-only; statically linked).
+2. [x] Write `mctpcore::FfsBinding`: `recv_frame()` strips USB header → `mctp_bus_rx()`;
+   `tx_cb()` prepends USB header → writes ep-IN. EID re-registration after Set EID.
+3. [x] Wire via `FrameProcessor` hook in `ffs_serve`; `mctpusbd` passes lambda that
+   lazily constructs `FfsBinding` on first frame post-ENABLE.
+4. [ ] **Hardware verify** (gate): 4 control commands pass on aspeed-2700 via libmctp-core.
+
+**Note:** SDK libmctp (openbmc 0.11) `mctp_rx_fn` order: `(src_eid, tag_owner, msg_tag,
+data, msg, len)` — `data` is 4th; NVIDIA fork reverses `data`/`msg`.
 
 **Gate to Step C:** 4 control commands pass on aspeed-2700 with libmctp-core engine.
 No regression on the step-5 baseline.
@@ -143,10 +146,12 @@ end-to-end on aspeed-2700.
 
 ## Pre-implementation research still needed
 
-- [ ] Read `libpldm/transport/mctp-demux.c` — pin demux wire protocol before Step C
-- [ ] Decide libmctp fork: openbmc/libmctp vs NVIDIA libmctp (affects Step B subproject
-      setup and pldmd dialect compatibility)
-- [ ] Confirm which libmctp version pldmd's libpldm was built against (to match engine)
+- [x] Decide libmctp fork: **NVIDIA fork** confirmed (already in use as subproject).
+      `mctp_rx_fn` order is identical to openbmc 0.11; NVIDIA fork is a strict superset.
+- [x] Confirm which libmctp version pldmd's libpldm was built against: **not applicable** —
+      pldm/libpldm does not link libmctp at all; it speaks the demux socket protocol only.
+- [ ] Read `libpldm/transport/mctp-demux.c` (or NVIDIA `mctp-demux-daemon.c`) — pin
+      exact demux wire protocol before implementing the server side of Step C.
 
 ---
 

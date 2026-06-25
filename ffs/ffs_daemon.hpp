@@ -15,7 +15,9 @@
 #pragma once
 
 #include <csignal>
+#include <cstdint>
 #include <functional>
+#include <span>
 #include <string>
 
 namespace ffsd {
@@ -28,12 +30,31 @@ enum class Mode { Mctp, Echo };
 // loop. ffsd installs no handler, so it never sets this and behaves as before.
 extern volatile std::sig_atomic_t g_stop;
 
+// Optional frame processor injected by the caller for the Mctp data path.
+// When set, ffs_serve calls it instead of the built-in standalone engine
+// (mctpep::process) for each received USB frame.
+//
+// Arguments: (frame, ep_in_fd, mps_in)
+//   frame     — raw USB bytes read from ep-OUT (host→device)
+//   ep_in_fd  — open fd for ep-IN (device→host); processor writes its own reply
+//   mps_in    — ep-IN wMaxPacketSize (for ZLP decisions; 0 = skip ZLP)
+//
+// The processor is responsible for writing any reply to ep_in_fd.
+// It is NOT called for Echo mode (handled before this hook).
+using FrameProcessor =
+    std::function<void(std::span<const std::uint8_t>, int, int)>;
+
 // Open <mount>/ep0, write the MCTP descriptors + strings, then invoke on_ready
 // (the "descriptors written, now safe to enable the UDC" seam; return false to
 // abort). After that, service ep0 lifecycle events and the bulk data loop until
 // ep0 closes, an error occurs, or g_stop is set. Returns 0 on clean exit, 1 on
 // error.
+//
+// on_frame: when set (Mctp mode only), overrides the built-in standalone MCTP
+// engine.  ffsd passes nothing (keeps the standalone trace path); mctpusbd
+// passes a FrameProcessor that routes through the libmctp-core binding.
 int ffs_serve(const std::string &mount, Mode mode,
-	      const std::function<bool()> &on_ready = {});
+	      const std::function<bool()> &on_ready = {},
+	      FrameProcessor on_frame = {});
 
 } // namespace ffsd
