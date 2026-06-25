@@ -30,10 +30,16 @@ Development assumption: **all required kernel configs are enabled**
 - **Device side is the gap**: libmctp's USB binding (`usb.c`) is **host-only
   (libusb)**; it cannot make the machine *become* a USB peripheral. Acting as a
   device requires the **USB gadget subsystem + a UDC**.
-- We are **deliberately avoiding the newer in-kernel MCTP-over-USB for now**, doing
-  a userspace implementation to learn the feasibility and effort of "device side in
-  userspace". Once clarified, we can decide whether to instead adopt the kernel
-  MCTP stack wholesale.
+- We started with a **deliberate userspace-first approach** (FunctionFS + demux
+  socket) to learn feasibility before committing to kernel development.
+- **2026-06-25 update — direction shifting toward kernel MCTP stack.** Analysis
+  revealed the demux socket path conflicts with the dual-role requirement: one
+  pldmd instance cannot simultaneously use `transport-af-mctp` (USB host side,
+  kernel stack) and `transport-mctp-demux` (USB device side, our socket). The
+  kernel MCTP stack's multi-interface routing is the correct unifier. See
+  [`ARCH-TRANSPORT.md`](./ARCH-TRANSPORT.md) for the full analysis and Options
+  A1 / A2 / B. Decision on whether to discard the demux socket work (Step C) is
+  pending.
 
 ---
 
