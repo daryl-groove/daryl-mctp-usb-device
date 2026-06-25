@@ -17,8 +17,10 @@
 #include <csignal>
 #include <cstdint>
 #include <functional>
+#include <poll.h>
 #include <span>
 #include <string>
+#include <vector>
 
 namespace ffsd {
 
@@ -44,6 +46,20 @@ extern volatile std::sig_atomic_t g_stop;
 using FrameProcessor =
     std::function<void(std::span<const std::uint8_t>, int, int)>;
 
+// Extension point for extra fds in the ffs_serve poll loop (Step C).
+//
+// collect  — called each iteration before poll(); append any extra pollfd
+//            entries to the vector (fds[0]=ep0, fds[1]=ep1 are already there).
+// dispatch — called each iteration after poll(); inspect revents and handle
+//            events for the fds collect() added. The full fds span is passed so
+//            the lambda can locate its entries by fd value.
+//
+// Both fields default to empty (no-op), so existing callers are unaffected.
+struct PollExt {
+	std::function<void(std::vector<pollfd> &)> collect;
+	std::function<void(std::span<const pollfd>)> dispatch;
+};
+
 // Open <mount>/ep0, write the MCTP descriptors + strings, then invoke on_ready
 // (the "descriptors written, now safe to enable the UDC" seam; return false to
 // abort). After that, service ep0 lifecycle events and the bulk data loop until
@@ -53,8 +69,11 @@ using FrameProcessor =
 // on_frame: when set (Mctp mode only), overrides the built-in standalone MCTP
 // engine.  ffsd passes nothing (keeps the standalone trace path); mctpusbd
 // passes a FrameProcessor that routes through the libmctp-core binding.
+//
+// poll_ext: optional collect/dispatch hooks for extra fds (Step C DemuxServer).
 int ffs_serve(const std::string &mount, Mode mode,
 	      const std::function<bool()> &on_ready = {},
-	      FrameProcessor on_frame = {});
+	      FrameProcessor on_frame = {},
+	      PollExt poll_ext = {});
 
 } // namespace ffsd

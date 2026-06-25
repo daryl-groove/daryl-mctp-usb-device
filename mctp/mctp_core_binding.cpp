@@ -1,6 +1,7 @@
 #include "mctp_core_binding.hpp"
 
 #include "mctp_control.hpp"
+#include "mctp_demux_server.hpp"
 
 extern "C" {
 #include <libmctp.h>
@@ -49,6 +50,13 @@ struct FfsBinding::Impl {
     mctpctrl::EndpointState *state = nullptr;
     int ep_in_fd = -1;
     int mps_in = 0;
+
+    // Step C: optional PLDM forwarding via DemuxServer.
+    DemuxServer *demux = nullptr;
+    // Single pending-request slot: saves the host's tag so we can reply.
+    uint8_t pending_eid = 0;
+    uint8_t pending_tag = 0;
+    bool pending_valid = false;
 
     // libmctp calls this to transmit one (possibly fragmented) MCTP packet.
     // Returns 0 on success (pktbuf released by core), negative to drop.
@@ -123,8 +131,18 @@ struct FfsBinding::Impl {
             }
             break;
         }
+        case MsgTypePldm:
+            // Save the host's tag so on_client_rx() can reply with it.
+            // body already includes the type byte; forward as-is.
+            if (impl->demux) {
+                impl->pending_eid = src_eid;
+                impl->pending_tag = msg_tag;
+                impl->pending_valid = true;
+                impl->demux->forward_to_client(src_eid, body);
+            }
+            return; // no in-process reply; pldmd will respond via on_client_rx
         default:
-            return; // unknown type: drop (PLDM forwarding is Step C)
+            return; // unknown type: drop
         }
 
         if (reply.empty())
@@ -173,6 +191,32 @@ FfsBinding::FfsBinding(int ep_in_fd, mctpctrl::EndpointState &state,
 {}
 
 FfsBinding::~FfsBinding() = default;
+
+void FfsBinding::set_demux(DemuxServer *s)
+{
+    impl_->demux = s;
+}
+
+void FfsBinding::on_client_rx()
+{
+    if (!impl_->demux)
+        return;
+    auto result = impl_->demux->recv_from_client();
+    if (!result)
+        return;
+    if (!impl_->pending_valid)
+        return; // unsolicited response: drop
+
+    auto [dest_eid, msg] = std::move(*result);
+    if (msg.empty())
+        return;
+
+    // msg = [0x01][pldm_payload...]; pass whole body to libmctp which fragments
+    // and writes to ep-IN via tx_cb.  TO=false: host sent the request (TO=1).
+    mctp_message_tx(impl_->mctp, dest_eid, false, impl_->pending_tag,
+                    msg.data(), msg.size());
+    impl_->pending_valid = false;
+}
 
 void FfsBinding::recv_frame(std::span<const std::uint8_t> usb_frame)
 {

@@ -319,7 +319,8 @@ Ep0Status handle_ep0(int ep0, Context &ctx)
 } // namespace
 
 int ffs_serve(const std::string &mount, Mode mode,
-	      const std::function<bool()> &on_ready, FrameProcessor on_frame)
+	      const std::function<bool()> &on_ready, FrameProcessor on_frame,
+	      PollExt poll_ext)
 {
 	Context ctx;
 	ctx.mount = mount;
@@ -356,20 +357,22 @@ int ffs_serve(const std::string &mount, Mode mode,
 
 	// Event loop: ep0 always polled for lifecycle events; ep1 (OUT) added
 	// once enabled. ep2 (IN) is only written to, so it is not polled.
+	// PollExt lets callers (mctpusbd) inject extra fds (e.g. DemuxServer).
 	for (;;) {
 		if (g_stop) {
 			std::cout << "stop requested; exiting event loop\n";
 			return 0;
 		}
 
-		struct pollfd fds[2];
-		nfds_t nfds = 0;
-		fds[nfds++] = { ep0.get(), POLLIN, 0 };
+		std::vector<pollfd> fds;
+		fds.push_back({ ep0.get(), POLLIN, 0 });
 		const bool haveOut = ctx.epOut.valid();
 		if (haveOut)
-			fds[nfds++] = { ctx.epOut.get(), POLLIN, 0 };
+			fds.push_back({ ctx.epOut.get(), POLLIN, 0 });
+		if (poll_ext.collect)
+			poll_ext.collect(fds);
 
-		int pr = ::poll(fds, nfds, -1);
+		int pr = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), -1);
 		if (pr < 0) {
 			if (errno == EINTR)
 				continue; // re-check g_stop at loop top
@@ -391,9 +394,13 @@ int ffs_serve(const std::string &mount, Mode mode,
 
 		// ep1 may have been closed by a DISABLE handled just above, so
 		// re-check validity and that it was the polled fd.
-		if (haveOut && nfds >= 2 && ctx.epOut.valid() &&
+		if (haveOut && fds.size() >= 2 && ctx.epOut.valid() &&
 		    (fds[1].revents & POLLIN))
 			handle_out(ctx);
+
+		// Extra fds: DemuxServer and any future extension points.
+		if (poll_ext.dispatch)
+			poll_ext.dispatch(std::span{fds});
 	}
 }
 

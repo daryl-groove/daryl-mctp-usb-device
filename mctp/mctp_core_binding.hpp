@@ -1,4 +1,4 @@
-// libmctp-core FunctionFS binding (Step B).
+// libmctp-core FunctionFS binding (Step B+C).
 //
 // Wraps the libmctp-core library as a pure transport engine (no AF_MCTP,
 // no kernel dependency).  Two FunctionFS bulk endpoints are wired to core:
@@ -12,11 +12,9 @@
 //     packet.  Prepends the 4-byte DSP0283 USB framing header and writes to
 //     the ep-IN fd (device→host).
 //
-// The MCTP control responder (mctpctrl::handle, type 0x00) is unchanged from
-// the standalone path.  After a successful Set Endpoint ID the binding
-// re-registers the bus with the new EID so libmctp accepts subsequent packets
-// addressed to that EID.  Unknown message types are dropped (PLDM forwarding
-// is Step C).
+// Type 0x00 (control): handled in-process by mctpctrl::handle.
+// Type 0x01 (PLDM): forwarded to a DemuxServer client (Step C); dropped if
+//   no DemuxServer is wired (set_demux not called or called with nullptr).
 
 #pragma once
 
@@ -27,6 +25,8 @@
 #include <span>
 
 namespace mctpcore {
+
+class DemuxServer; // forward declaration — defined in mctp_demux_server.hpp
 
 class FfsBinding {
 public:
@@ -42,6 +42,15 @@ public:
     // Reassembly, message-type dispatch, and reply transmission are handled
     // internally; the caller does not need to write to ep-IN.
     void recv_frame(std::span<const std::uint8_t> usb_frame);
+
+    // Wire a DemuxServer for PLDM forwarding (Step C).
+    // nullptr = type 0x01 messages are silently dropped (default).
+    // Ownership stays with the caller; must outlive this binding.
+    void set_demux(DemuxServer *s);
+
+    // Call when the DemuxServer's client_fd is readable (poll POLLIN fired).
+    // Reads one response from the client and transmits it via mctp_message_tx.
+    void on_client_rx();
 
 private:
     struct Impl;

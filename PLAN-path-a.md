@@ -126,18 +126,68 @@ No regression on the step-5 baseline.
 
 ### Step C — Demux socket server + pldmd integration
 
-**Scope:** new `ffs/mctp_demux_server.{hpp,cpp}`. mctpusbd listens on a Unix socket;
-pldmd connects using `mctp-demux` transport.
+**Scope:** new `mctp/mctp_demux_server.{hpp,cpp}` (NOT `ffs/` — pure Unix socket IPC,
+no FunctionFS dependency; placing it in `ffs/` would invert the app→ffs→mctp DAG).
+mctpusbd listens on a Unix socket; pldmd connects using `mctp-demux` transport.
+
+#### Pinned wire protocol (libpldm dialect) — confirmed 2026-06-25
+
+Source: `/home/daryl/work/project/obmc_new/libs/libpldm/src/transport/mctp-demux.c`
+
+**Key delta from NVIDIA `mctp-demux-daemon.c`**: the two are different protocols.
+pldmd uses libpldm's dialect (2-byte prefix, no tag byte), NOT the NVIDIA 3-byte format.
+
+| | NVIDIA daemon | libpldm (what pldmd actually uses) |
+|---|---|---|
+| Socket path | `"\0mctp-*-mux"` (per-binding) | `"\0mctp-mux"` (fixed) |
+| TX prefix (client→server) | `[tag_info][eid][type]` = 3 bytes | `[eid][type]` = 2 bytes |
+| RX prefix (server→client) | `[(tag<<3)\|owner][eid][type]` = 3 bytes | `[eid][type]` = 2 bytes |
+
+**Wire format**:
+- Socket: `AF_UNIX`, `SOCK_SEQPACKET`, abstract path `"\0mctp-mux"`
+- Registration (first write after connect): `[0x01]` — 1 byte, PLDM msg type
+- RX (server → pldmd): `[src_eid][0x01][pldm_payload...]`
+  where `[0x01][pldm_payload]` = full MCTP message body from libmctp `rx_all_cb`
+- TX (pldmd → server): `[dest_eid][0x01][pldm_payload...]`
+  mctpusbd strips `dest_eid`, calls `mctp_message_tx(mctp, dest_eid, false, saved_tag,
+  buf+1, len-1)` where `buf+1` = `[0x01][pldm_payload]`
+
+**Tag tracking** (no tag in socket protocol):
+- `rx_all_cb` type `0x01`: save `{src_eid, msg_tag}` (host sends TO=1, tag=N)
+- On TX response: use saved `msg_tag`, pass `tag_owner=false`
+- v1: single pending-request slot (one PLDM request in flight at a time — sufficient for device-side responder)
+
+#### Implementation design
+
+```
+DemuxServer (mctp/mctp_demux_server.{hpp,cpp}) — pure socket layer
+  server_fd() / client_fd()         ← fds for poll loop
+  accept_client()                   ← reads 1-byte registration, stores type
+  forward_to_client(eid, mctp_msg)  ← sendmsg [src_eid][msg...]
+  recv_from_client() → optional<{dest_eid, mctp_msg}>
+
+FfsBinding::Impl additions
+  DemuxServer* demux_server         ← optional; null = type 0x01 still dropped
+  uint8_t pending_eid, pending_tag  ← single-slot tag tracking
+
+ffs_daemon.hpp: add PollExt
+  struct PollExt {
+      function<void(vector<pollfd>&)>      collect;   // add fds before poll()
+      function<void(span<const pollfd>)>   dispatch;  // handle revents after poll()
+  };
+  ffs_serve(..., PollExt poll_ext = {})
+  (pollfds array → vector; DemuxServer provides the two lambdas)
+```
 
 Sub-steps:
-1. Read `libpldm/transport/mctp-demux.c` — pin the exact wire protocol (registration
-   byte, message header format, routing rules).
-2. Implement the server side: accept pldmd's connection, receive its type registration
-   (0x01 = PLDM), forward received type-0x01 MCTP messages, deliver replies back.
-3. Wire into the router (Step A seam): type 0x01 → `mctp_demux_server::forward()`.
-4. Build pldmd with `transport-implementation=mctp-demux` (Yocto recipe).
-5. End-to-end test: host sends a PLDM Get TID request; pldmd responds; verify on host.
-6. Update `GetMessageTypeSupport` to return `[0x00, 0x01]`.
+1. [x] Read `libpldm/transport/mctp-demux.c` — protocol pinned (see above).
+2. Implement `DemuxServer` — listen + accept + registration + forward/recv.
+   Unit-testable in isolation (no libmctp dependency).
+3. Extend `FfsBinding`: add `DemuxServer*` + tag slot; `rx_all_cb` type `0x01` → forward.
+4. Extend `ffs_serve`: `PollExt`; `mctpusbd.cpp` constructs `DemuxServer` + wires lambdas.
+5. Build pldmd with `transport-implementation=mctp-demux` (Yocto recipe).
+6. End-to-end test: host sends a PLDM Get TID request; pldmd responds; verify on host.
+7. Update `GetMessageTypeSupport` to return `[0x00, 0x01]`.
 
 **Gate:** at least one PLDM command (Get TID or Get Terminus UID) round-trips correctly
 end-to-end on aspeed-2700.
@@ -150,15 +200,18 @@ end-to-end on aspeed-2700.
       `mctp_rx_fn` order is identical to openbmc 0.11; NVIDIA fork is a strict superset.
 - [x] Confirm which libmctp version pldmd's libpldm was built against: **not applicable** —
       pldm/libpldm does not link libmctp at all; it speaks the demux socket protocol only.
-- [ ] Read `libpldm/transport/mctp-demux.c` (or NVIDIA `mctp-demux-daemon.c`) — pin
-      exact demux wire protocol before implementing the server side of Step C.
+- [x] Read `libpldm/transport/mctp-demux.c` (and NVIDIA `mctp-demux-daemon.c`) — protocol
+      pinned 2026-06-25. libpldm uses a **different** dialect from the NVIDIA daemon:
+      `"\0mctp-mux"` socket, 2-byte `[eid][type]` prefix (no tag byte). Full details in
+      Step C above.
 
 ---
 
 ## What this does NOT change
 
 - `ffsd` and `gadget.sh` — untouched, permanent debug path
-- `ffs_daemon.{hpp,cpp}` — the FunctionFS event loop; Step B wires into it, not replaces it
+- `ffs_daemon.{hpp,cpp}` — the FunctionFS event loop; Step C adds a lightweight `PollExt`
+  parameter (collect/dispatch lambdas for extra fds); the existing interface is unchanged
 - `ffs_descriptors.hpp` — descriptor blob unchanged
 - `mctpctrl.{hpp,cpp}` and its tests — the control responder is demoted to a handler,
   its logic and tests are unchanged

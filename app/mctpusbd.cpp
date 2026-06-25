@@ -18,6 +18,7 @@
 #include "ffs_daemon.hpp"
 #include "mctp_control.hpp"
 #include "mctp_core_binding.hpp"
+#include "mctp_demux_server.hpp"
 
 #include <csignal>
 #include <cstring>
@@ -119,13 +120,17 @@ int main(int argc, char **argv)
 	std::unique_ptr<mctpcore::FfsBinding> core_binding;
 	int last_ep_in_fd = -1;
 
+	// Step C: demux socket server — pldmd connects here for PLDM (type 0x01).
+	// Created unconditionally in Mctp mode; PollExt wires it into the poll loop.
+	mctpcore::DemuxServer demux_server;
+
 	// Build the FrameProcessor only for Mctp mode (Echo is handled before
 	// the processor hook in ffs_daemon, so it never calls this lambda).
 	ffsd::FrameProcessor frame_proc;
 	if (opt.mode == ffsd::Mode::Mctp) {
-		frame_proc = [&core_binding, &core_state,
-			      &last_ep_in_fd](std::span<const std::uint8_t> frame,
-					      int ep_in_fd, int mps_in) {
+		frame_proc = [&core_binding, &core_state, &last_ep_in_fd,
+			      &demux_server](std::span<const std::uint8_t> frame,
+					     int ep_in_fd, int mps_in) {
 			// Re-create the binding on each new ENABLE (detected by a
 			// different ep_in_fd) so stale fds are never reused.
 			if (!core_binding || last_ep_in_fd != ep_in_fd) {
@@ -133,8 +138,38 @@ int main(int argc, char **argv)
 				    std::make_unique<mctpcore::FfsBinding>(
 					ep_in_fd, core_state, mps_in);
 				last_ep_in_fd = ep_in_fd;
+				core_binding->set_demux(&demux_server);
 			}
 			core_binding->recv_frame(frame);
+		};
+	}
+
+	// PollExt: inject DemuxServer fds into the ffs_serve poll loop.
+	// collect adds the server fd (always) and the client fd (when connected).
+	// dispatch routes POLLIN events to accept_client() or on_client_rx().
+	ffsd::PollExt poll_ext;
+	if (opt.mode == ffsd::Mode::Mctp) {
+		poll_ext.collect = [&demux_server](std::vector<pollfd> &fds) {
+			if (demux_server.server_fd() >= 0)
+				fds.push_back(
+					{ demux_server.server_fd(), POLLIN, 0 });
+			if (demux_server.client_fd() >= 0)
+				fds.push_back(
+					{ demux_server.client_fd(), POLLIN, 0 });
+		};
+		poll_ext.dispatch = [&demux_server,
+				     &core_binding](std::span<const pollfd> fds) {
+			for (const auto &pfd : fds) {
+				if (!pfd.revents)
+					continue;
+				if (pfd.fd == demux_server.server_fd()) {
+					if (pfd.revents & POLLIN)
+						demux_server.accept_client();
+				} else if (pfd.fd == demux_server.client_fd()) {
+					if ((pfd.revents & POLLIN) && core_binding)
+						core_binding->on_client_rx();
+				}
+			}
 		};
 	}
 
@@ -213,7 +248,7 @@ int main(int argc, char **argv)
 			"UDC bound ({}); enumerating\n",
 			opt.udc.empty() ? "auto" : opt.udc.c_str());
 		return true;
-	}, std::move(frame_proc));
+	}, std::move(frame_proc), std::move(poll_ext));
 
 cleanup:
 	// Undo in reverse: clear the UDC, unmount, then remove the gadget.

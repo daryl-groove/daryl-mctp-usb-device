@@ -470,6 +470,102 @@ shortcut a fuller implementation would tighten; the other two are correct as-is.
 
 > Append newest entries at the top. Format: `### YYYY-MM-DD — summary`
 
+### 2026-06-25 — architectural review: demux socket path has a dual-role ceiling; kernel MCTP stack is the target direction
+
+**Context.** After completing Step C (demux socket server), a deeper analysis of the
+full system requirements revealed a fundamental conflict. Full analysis in
+[`ARCH-TRANSPORT.md`](./ARCH-TRANSPORT.md).
+
+**Key findings:**
+
+- `mctp-demux-daemon`'s USB binding (`libmctp/usb.c`) uses `libusb` and is **host-only**.
+  It is not a device-side implementation. Our `mctpusbd` (FunctionFS / UDC) is the correct
+  device-side answer — these are opposite ends of the USB cable.
+
+- `pldmd` is not host-specific (it is a PLDM daemon, can be requester or responder), but it
+  supports only **one transport backend at a time** (`transport-af-mctp` OR `transport-mctp-demux`,
+  compile-time choice). A machine that is simultaneously USB host (kernel `mctp-usb` → AF_MCTP)
+  and USB device (our FunctionFS → demux socket) would require two incompatible backends in
+  one pldmd — they collide.
+
+- The kernel MCTP stack (5.15+) is a **multi-interface router**: if both USB host and USB
+  device sides register as kernel MCTP net devices, pldmd uses `AF_MCTP` and the kernel
+  routes across both. Conflict disappears.
+
+- The upstream USB gadget-side MCTP kernel driver does not exist (Linux 6.15 merged the host
+  side `mctp-usb.ko`; no gadget counterpart). We must bridge FunctionFS to the kernel stack
+  ourselves.
+
+**New options (supersede the earlier "Path A" demux plan):**
+
+| | | |
+|---|---|---|
+| **A1** | PTY + `mctp-serial` line discipline | No kernel module; needs DSP0253 framing in userspace |
+| **A2** | Small kernel module (~200 LOC) | Cleanest; A1 stepping stone leads here naturally |
+| **B**  | Full kernel MCTP gadget driver | Correct long-term upstream direction; highest effort |
+
+A1 → A2 is incremental (ffs_daemon + USB packet handling reused; only framing/PTY layer
+replaced by chardev + kernel module). Not a full rewrite.
+
+**Superseded earlier notes.** Two earlier entries in this log are now contradicted:
+- *"mctp-serial-over-pty… possible but ugly and not worth it"* — this assessment did not
+  account for the A1→A2 stepping-stone value. A1 is a reasonable intermediate step.
+- *"Short-term decision: go Path A (demux socket), accept the shelf-life"* — this decision
+  is under review; the dual-role conflict makes the shelf-life shorter than acceptable.
+
+**Pending decision.** Whether to discard Step C C++ changes (commit `e618f40e` and unstaged
+changes) and pivot to Option A1 is not yet finalized. `ffs_daemon.cpp` is safe in all paths.
+First gate: confirm `CONFIG_MCTP_SERIAL` is enabled on the aspeed-2700 kernel.
+
+### 2026-06-25 — Step C implementation: C2+C3+C4 done; 28/28 tests pass
+
+- **C2 — `mctp/mctp_demux_server.{hpp,cpp}`**: `mctpcore::DemuxServer` — pure Unix socket
+  server (AF_UNIX SOCK_SEQPACKET `"\0mctp-mux"`). API: `server_fd()` / `client_fd()` (for
+  poll); `accept_client()` (accept + 1-byte registration); `forward_to_client(src_eid, msg)`
+  (→ `[src_eid][msg...]`); `recv_from_client()` (→ `{dest_eid, msg}`). No libmctp dependency.
+- **C3 — `mctp/mctp_core_binding.{hpp,cpp}`**: Added `DemuxServer*` + single-slot
+  `{pending_eid, pending_tag, pending_valid}` to `FfsBinding::Impl`; `rx_all_cb` type 0x01
+  branch → `demux->forward_to_client(src_eid, body)` + saves tag. New public methods:
+  `set_demux(DemuxServer*)` and `on_client_rx()` (reads from client, calls `mctp_message_tx`
+  with saved tag). Type 0x01 is silently dropped when `demux == nullptr`.
+- **C4 — `ffs/ffs_daemon.{hpp,cpp}` + `app/mctpusbd.cpp`**: Added `PollExt` struct
+  (`collect` / `dispatch` lambdas); `ffs_serve` poll loop migrated from fixed array to
+  `std::vector<pollfd>` with PollExt hooks. `mctpusbd.cpp`: constructs `DemuxServer`,
+  builds collect/dispatch lambdas, calls `set_demux` on first ENABLE.
+- **Tests**: `test/test_demux_server.cpp` — 6 GTest cases (construction, accept, forward,
+  recv, disconnect, no-client). All 6 new + 22 existing = **28/28 pass** (native g++ build).
+- **meson.build**: `mctp/mctp_demux_server.cpp` added to mctpusbd sources; `test_demux_server`
+  target added.
+- **next**: Step B hardware gate (deploy build-sdk/mctpusbd to aspeed-2700 — 4 control
+  commands via libmctp-core); then Step C hardware gate (pldmd with `transport=mctp-demux`,
+  PLDM Get TID round-trip). Step C7 (update GetMessageTypeSupport → `[0x00, 0x01]`) is
+  intentionally last, after end-to-end PLDM test passes.
+
+### 2026-06-25 — Step C pre-research: demux wire protocol pinned; implementation design fixed
+
+- **Demux wire protocol pinned** (pre-implementation research item for Step C now complete):
+  - Read both `libmctp/utils/mctp-demux-daemon.c` (NVIDIA, 2049 lines) and
+    `libpldm/src/transport/mctp-demux.c` (openbmc, the file pldmd actually uses).
+  - **Key finding — two different protocols**: NVIDIA daemon uses a 3-byte prefix
+    `[tag_info][eid][type]` with per-binding socket names (`"\0mctp-*-mux"`); libpldm uses
+    a simpler 2-byte prefix `[eid][type]` with fixed socket name `"\0mctp-mux"` and no tag
+    byte in either direction. We must implement the libpldm dialect (pldmd connects to that).
+  - Pinned protocol: `AF_UNIX SOCK_SEQPACKET "\0mctp-mux"`; registration = 1 byte `0x01`;
+    RX (server→pldmd) = `[src_eid][0x01][pldm_payload]`; TX (pldmd→server) = `[dest_eid][0x01][pldm_payload]`.
+    Full details in PLAN-path-a.md Step C.
+- **Design error corrected in PLAN-path-a.md**: Step C scope had `ffs/mctp_demux_server.{hpp,cpp}`;
+  corrected to `mctp/mctp_demux_server.{hpp,cpp}` — `DemuxServer` is pure Unix socket IPC with
+  no FunctionFS dependency; `ffs/` placement would invert the app→ffs→mctp DAG.
+- **Step C design concretised**: `DemuxServer` (socket layer) + `FfsBinding` tag-tracking slot
+  + `PollExt` extension to `ffs_serve` (collect/dispatch lambdas for extra poll fds). Tag
+  tracking: single pending `{src_eid, msg_tag}` slot (sufficient for device-side responder).
+  Sub-steps updated in PLAN-path-a.md.
+- **`transport-implementation=mctp-demux` confirmed** as the only viable choice: `af-mctp`
+  requires a kernel MCTP netdev; the gadget-side driver does not exist (same wall as noted
+  in the decisions log). Accepting demux shelf-life is the correct trade-off.
+- **next**: Step B hardware gate (deploy build-sdk/mctpusbd to aspeed-2700, verify 4 control
+  commands via libmctp-core engine); then Step C implementation.
+
 ### 2026-06-24 — Step B: libmctp-core FunctionFS binding implemented; cross build + 22 tests OK
 - **Step B complete (build + unit-test gate passed)**:
   - `subprojects/libmctp.wrap` + `subprojects/packagefiles/libmctp/meson.build` — wraps the

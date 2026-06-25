@@ -48,7 +48,11 @@ executable(
 libusbgx_dep = dependency('libusbgx')
 executable(
     'mctpusbd',
-    ['app/mctpusbd.cpp', 'mctp/mctp_core_binding.cpp'] + ffs_core,
+    [
+        'app/mctpusbd.cpp',
+        'mctp/mctp_core_binding.cpp',
+        'mctp/mctp_demux_server.cpp',
+    ] + ffs_core,
     include_directories: engine_inc,
     dependencies: [libusbgx_dep, libmctp_dep],
     install: false,
@@ -110,3 +114,12 @@ test_endpoint = executable(
     install: false,
 )
 test('endpoint', test_endpoint, protocol: 'gtest')
+
+test_demux_server = executable(
+    'test_demux_server',
+    ['test/test_demux_server.cpp', 'mctp/mctp_demux_server.cpp'],
+    dependencies: [gtest_dep],
+    include_directories: engine_inc,
+    install: false,
+)
+test('demux_server', test_demux_server, protocol: 'gtest')
