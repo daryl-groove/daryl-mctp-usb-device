@@ -2,6 +2,8 @@
 
 #include "ffs_descriptors.h"
 #include "mctp_endpoint.h"
+#include "mctp_serial_frame.h"
+#include "mctp_usb_frame.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -40,6 +42,18 @@ static int write_all(int fd, const void *buf, size_t len, const char *what)
 	return 0;
 }
 
+/* ── PTY rx state machine ───────────────────────────────────────────────────── */
+
+typedef enum {
+	PTY_RX_HUNT,      /* waiting for start sync 0x7E */
+	PTY_RX_LEN_HI,   /* reading length high byte */
+	PTY_RX_LEN_LO,   /* reading length low byte */
+	PTY_RX_PAYLOAD,  /* reading payload bytes */
+	PTY_RX_FCS_HI,   /* reading FCS high byte */
+	PTY_RX_FCS_LO,   /* reading FCS low byte */
+	PTY_RX_END,      /* expecting end sync 0x7E */
+} pty_rx_state_t;
+
 /* ── ep0 lifecycle ─────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -48,7 +62,13 @@ typedef struct {
 	int          ep_out;   /* ep1, host->device (we read); -1 = closed */
 	int          ep_in;    /* ep2, device->host (we write); -1 = closed */
 	int          mps_in;   /* ep2 wMaxPacketSize for ZLP; 0 = unknown   */
+	int          pty_master_fd; /* PTY bridge mode only; -1 otherwise    */
 	mctp_endpoint_state_t ep_state;
+	/* PTY rx reassembly */
+	pty_rx_state_t  pty_rx_state;
+	uint8_t         pty_rx_buf[MCTP_SERIAL_MAX_FRAME];
+	size_t          pty_rx_pos;
+	size_t          pty_rx_payload_left;
 } ffs_ctx_t;
 
 static const char *event_name(uint8_t type)
@@ -88,8 +108,10 @@ static void on_enable(ffs_ctx_t *ctx)
 	ctx->mps_in = (ioctl(ctx->ep_in, FUNCTIONFS_ENDPOINT_DESC, &desc) == 0)
 	              ? (int)le16toh(desc.wMaxPacketSize) : 0;
 
-	printf("ENABLE: ep1/ep2 open, mode=%s, IN mps=%d\n",
-	       ctx->mode == FFS_MODE_ECHO ? "echo" : "mctp", ctx->mps_in);
+	const char *mode_name =
+		ctx->mode == FFS_MODE_ECHO        ? "echo" :
+		ctx->mode == FFS_MODE_PTY_BRIDGE  ? "pty-bridge" : "mctp";
+	printf("ENABLE: ep1/ep2 open, mode=%s, IN mps=%d\n", mode_name, ctx->mps_in);
 }
 
 static void on_disable(ffs_ctx_t *ctx)
@@ -112,6 +134,8 @@ static void write_in_frame(ffs_ctx_t *ctx,
 	}
 }
 
+/* ── USB OUT handler ────────────────────────────────────────────────────────── */
+
 static void handle_out(ffs_ctx_t *ctx)
 {
 	uint8_t buf[MAX_FRAME];
@@ -125,23 +149,153 @@ static void handle_out(ffs_ctx_t *ctx)
 	if (n == 0)
 		return;
 
-	if (ctx->mode == FFS_MODE_ECHO) {
+	switch (ctx->mode) {
+	case FFS_MODE_ECHO:
 		write_in_frame(ctx, buf, (size_t)n);
 		return;
-	}
 
-	uint8_t resp[MAX_RESP];
-	const size_t resp_len = mctp_endpoint_process(
-		&ctx->ep_state, buf, (size_t)n, resp, sizeof(resp));
-
-	if (resp_len == 0) {
-		printf("    -> no response\n");
+	case FFS_MODE_MCTP: {
+		uint8_t resp[MAX_RESP];
+		const size_t resp_len = mctp_endpoint_process(
+			&ctx->ep_state, buf, (size_t)n, resp, sizeof(resp));
+		if (resp_len == 0) {
+			printf("    -> no response\n");
+			return;
+		}
+		write_in_frame(ctx, resp, resp_len);
+		printf("    endpoint state: EID=%u\n", (unsigned)ctx->ep_state.eid);
 		return;
 	}
 
-	write_in_frame(ctx, resp, resp_len);
-	printf("    endpoint state: EID=%u\n", (unsigned)ctx->ep_state.eid);
+	case FFS_MODE_PTY_BRIDGE: {
+		const mctp_usb_decode_result_t d = mctp_usb_decode(buf, (size_t)n);
+		if (d.error != MCTP_USB_DECODE_OK) {
+			fprintf(stderr, "USB->PTY: USB decode error %d\n", d.error);
+			return;
+		}
+		uint8_t serial_frame[MAX_FRAME + MCTP_SERIAL_OVERHEAD];
+		const size_t flen = mctp_serial_encode(
+			d.payload, d.payload_len,
+			serial_frame, sizeof(serial_frame));
+		if (flen == 0) {
+			fprintf(stderr, "USB->PTY: serial encode failed\n");
+			return;
+		}
+		write_all(ctx->pty_master_fd, serial_frame, flen, "PTY master");
+		return;
+	}
+	}
 }
+
+/* ── PTY master handler (kernel → USB IN) ───────────────────────────────────── */
+
+static void pty_rx_reset(ffs_ctx_t *ctx)
+{
+	ctx->pty_rx_state        = PTY_RX_HUNT;
+	ctx->pty_rx_pos          = 0;
+	ctx->pty_rx_payload_left = 0;
+}
+
+static void pty_rx_dispatch(ffs_ctx_t *ctx)
+{
+	const uint8_t *mctp_pkt;
+	size_t         mctp_len;
+
+	if (mctp_serial_decode(ctx->pty_rx_buf, ctx->pty_rx_pos,
+	                       &mctp_pkt, &mctp_len) < 0) {
+		fprintf(stderr, "PTY->USB: serial decode failed (FCS error?)\n");
+		return;
+	}
+
+	if (ctx->ep_in < 0)
+		return; /* USB not enabled; discard */
+
+	uint8_t usb_frame[MAX_RESP];
+	const size_t usb_len = mctp_usb_encode(mctp_pkt, mctp_len,
+	                                       usb_frame, sizeof(usb_frame));
+	if (usb_len == 0) {
+		fprintf(stderr, "PTY->USB: USB encode failed (packet too large?)\n");
+		return;
+	}
+
+	write_in_frame(ctx, usb_frame, usb_len);
+}
+
+static void pty_rx_feed(ffs_ctx_t *ctx, uint8_t byte)
+{
+	switch (ctx->pty_rx_state) {
+	case PTY_RX_HUNT:
+		if (byte != MCTP_SERIAL_SYNC)
+			break;
+		ctx->pty_rx_buf[0] = byte;
+		ctx->pty_rx_pos    = 1;
+		ctx->pty_rx_state  = PTY_RX_LEN_HI;
+		break;
+
+	case PTY_RX_LEN_HI:
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		ctx->pty_rx_payload_left = (size_t)byte << 8;
+		ctx->pty_rx_state = PTY_RX_LEN_LO;
+		break;
+
+	case PTY_RX_LEN_LO:
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		ctx->pty_rx_payload_left |= byte;
+		if (ctx->pty_rx_payload_left == 0 ||
+		    ctx->pty_rx_payload_left > MCTP_SERIAL_MAX_PAYLOAD) {
+			pty_rx_reset(ctx);
+			break;
+		}
+		ctx->pty_rx_state = PTY_RX_PAYLOAD;
+		break;
+
+	case PTY_RX_PAYLOAD:
+		if (ctx->pty_rx_pos >= sizeof(ctx->pty_rx_buf)) {
+			pty_rx_reset(ctx);
+			break;
+		}
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		if (--ctx->pty_rx_payload_left == 0)
+			ctx->pty_rx_state = PTY_RX_FCS_HI;
+		break;
+
+	case PTY_RX_FCS_HI:
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		ctx->pty_rx_state = PTY_RX_FCS_LO;
+		break;
+
+	case PTY_RX_FCS_LO:
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		ctx->pty_rx_state = PTY_RX_END;
+		break;
+
+	case PTY_RX_END:
+		if (byte != MCTP_SERIAL_SYNC) {
+			pty_rx_reset(ctx);
+			break;
+		}
+		ctx->pty_rx_buf[ctx->pty_rx_pos++] = byte;
+		pty_rx_dispatch(ctx);
+		pty_rx_reset(ctx);
+		break;
+	}
+}
+
+static void handle_pty_master(ffs_ctx_t *ctx)
+{
+	uint8_t chunk[256];
+	ssize_t n = read(ctx->pty_master_fd, chunk, sizeof(chunk));
+	if (n < 0) {
+		if (errno == EINTR || errno == EAGAIN)
+			return;
+		fprintf(stderr, "read PTY master failed: %s\n", strerror(errno));
+		return;
+	}
+	for (ssize_t i = 0; i < n; i++)
+		pty_rx_feed(ctx, chunk[i]);
+}
+
+/* ── ep0 event handler ──────────────────────────────────────────────────────── */
 
 typedef enum { EP0_CONTINUE, EP0_CLOSED, EP0_ERROR } ep0_status_t;
 
@@ -181,16 +335,18 @@ static ep0_status_t handle_ep0(int ep0, ffs_ctx_t *ctx)
 
 /* ── Public API ────────────────────────────────────────────────────────────── */
 
-int ffs_serve(const char *mount, ffs_mode_t mode,
+int ffs_serve(const char *mount, ffs_mode_t mode, int pty_master_fd,
               ffs_on_ready_fn on_ready, void *userdata)
 {
 	ffs_ctx_t ctx;
 	memset(&ctx, 0, sizeof(ctx));
 	snprintf(ctx.mount, sizeof(ctx.mount), "%s", mount);
-	ctx.mode   = mode;
-	ctx.ep_out = -1;
-	ctx.ep_in  = -1;
+	ctx.mode          = mode;
+	ctx.ep_out        = -1;
+	ctx.ep_in         = -1;
+	ctx.pty_master_fd = pty_master_fd;
 	mctp_endpoint_state_init(&ctx.ep_state);
+	pty_rx_reset(&ctx);
 
 	char ep0_path[256];
 	path_join(ep0_path, sizeof(ep0_path), mount, "ep0");
@@ -206,16 +362,17 @@ int ffs_serve(const char *mount, ffs_mode_t mode,
 	if (write_all(ep0, &desc, sizeof(desc), "descriptors") < 0) goto err;
 	if (write_all(ep0, &strs, sizeof(strs), "strings")     < 0) goto err;
 
-	printf("descriptors written (mode=%s); ready to bind a UDC\n",
-	       mode == FFS_MODE_ECHO ? "echo" : "mctp");
+	const char *mode_name =
+		mode == FFS_MODE_ECHO        ? "echo" :
+		mode == FFS_MODE_PTY_BRIDGE  ? "pty-bridge" : "mctp";
+	printf("descriptors written (mode=%s); ready to bind a UDC\n", mode_name);
 
-	/* Let the caller bind the UDC now that descriptors are in place. */
 	if (on_ready && on_ready(userdata) != 0) {
 		fprintf(stderr, "on_ready failed; aborting\n");
 		goto err;
 	}
 
-	/* Poll loop: ep0 always; ep1 (OUT) when enabled. */
+	/* Poll loop: ep0 always; ep_out when USB enabled; PTY master in bridge mode. */
 	for (;;) {
 		if (g_stop) {
 			printf("stop requested; exiting event loop\n");
@@ -223,16 +380,26 @@ int ffs_serve(const char *mount, ffs_mode_t mode,
 			return 0;
 		}
 
-		struct pollfd fds[2];
+		struct pollfd fds[3];
 		nfds_t nfds = 0;
+		int ep_out_slot = -1, pty_slot = -1;
+
 		fds[nfds].fd      = ep0;
 		fds[nfds].events  = POLLIN;
 		fds[nfds].revents = 0;
 		nfds++;
 
-		const int have_out = ctx.ep_out >= 0;
-		if (have_out) {
+		if (ctx.ep_out >= 0) {
+			ep_out_slot = (int)nfds;
 			fds[nfds].fd      = ctx.ep_out;
+			fds[nfds].events  = POLLIN;
+			fds[nfds].revents = 0;
+			nfds++;
+		}
+
+		if (mode == FFS_MODE_PTY_BRIDGE && ctx.pty_master_fd >= 0) {
+			pty_slot = (int)nfds;
+			fds[nfds].fd      = ctx.pty_master_fd;
 			fds[nfds].events  = POLLIN;
 			fds[nfds].revents = 0;
 			nfds++;
@@ -254,9 +421,12 @@ int ffs_serve(const char *mount, ffs_mode_t mode,
 			}
 		}
 
-		if (have_out && nfds >= 2 && ctx.ep_out >= 0 &&
-		    (fds[1].revents & POLLIN))
+		if (ep_out_slot >= 0 && ctx.ep_out >= 0 &&
+		    (fds[ep_out_slot].revents & POLLIN))
 			handle_out(&ctx);
+
+		if (pty_slot >= 0 && (fds[pty_slot].revents & POLLIN))
+			handle_pty_master(&ctx);
 	}
 
 err:

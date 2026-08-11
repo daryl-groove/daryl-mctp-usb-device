@@ -1,0 +1,149 @@
+================================
+mctpusbd A1 方案 - Guest 驗證步驟
+================================
+
+【最大前提：CONFIG_MCTP_SERIAL 必須存在】
+
+N_MCTP line discipline 依賴 CONFIG_MCTP_SERIAL。
+沒有它，TIOCSETD N_MCTP 直接回 EINVAL，整個 A1 方案進不去。
+請先做 Stage 0，確認後再繼續。
+
+
+────────────────────────────────
+Stage 0：確認 kernel 支援 N_MCTP
+────────────────────────────────
+
+方法 A（有 /proc/config.gz）：
+  zcat /proc/config.gz | grep -E 'MCTP_SERIAL|N_MCTP'
+  期望看到：CONFIG_MCTP_SERIAL=y
+           （若是 =m，則執行 modprobe mctp-serial 再繼續）
+
+方法 B（直接試掛）：
+  python3 -c "
+  import fcntl, os, ctypes
+  N_MCTP = 25
+  fd = os.open('/dev/ptmx', os.O_RDWR)
+  try:
+      libc = ctypes.CDLL(None)
+      ret = libc.ioctl(fd, 0x5423, ctypes.byref(ctypes.c_int(N_MCTP)))
+      print('N_MCTP OK' if ret == 0 else f'FAILED: {ret}')
+  except Exception as e:
+      print(f'FAILED: {e}')
+  finally:
+      os.close(fd)
+  "
+
+  → 若失敗：需 rebuild kernel，加 CONFIG_MCTP_SERIAL=y，先解 kernel 問題再繼續。
+
+
+────────────────────────────────
+Stage 1：Build + 部署
+────────────────────────────────
+
+在 host（需先進 SDK 環境）：
+
+  sdk-daryl
+  meson setup build-sdk
+  ninja -C build-sdk
+  scp build-sdk/mctpusbd guest:/tmp/
+
+
+────────────────────────────────
+Stage 2：啟動 mctpusbd，驗證 mctpserial0 出現
+────────────────────────────────
+
+在 guest 執行：
+
+  /tmp/mctpusbd /dev/ffs-mctp &
+
+預期 stdout 出現：
+  PTY /dev/pts/N: N_MCTP attached (mctpserial interface created)
+  gadget 'mctp' created; functionfs mounted at /dev/ffs-mctp
+  descriptors written (mode=pty-bridge); ready to bind a UDC
+
+確認 net device 出現：
+  ip link show mctpserial0
+  cat /sys/class/net/mctpserial0/type   ← 應為 290 (ARPHRD_MCTP)
+
+
+────────────────────────────────
+Stage 3：設定 MCTP 網路
+────────────────────────────────
+
+  ip link set mctpserial0 up
+  mctp link set mctpserial0 up
+  mctp address add 8 dev mctpserial0   ← 本端 EID 暫用 8
+
+  確認：
+  mctp address show
+
+注意：正式 OpenBMC 環境中，phosphor-mctp (mctp-ctrl) 會自動處理 EID 指派。
+      這裡手動 add 只是跳過 control responder 做功能驗證。
+
+
+────────────────────────────────
+Stage 4：USB 接通，驗證封包有流過
+────────────────────────────────
+
+dummy_hcd 環境下，UDC bind 在 mctpusbd 啟動時就會觸發（on_ready_enable_udc）。
+
+確認 USB 枚舉：
+  lsusb            ← 應看到 idVendor=1d6b, idProduct=0104
+  dmesg | tail -20 ← 應看到 FUNCTIONFS_ENABLE event + "UDC bound"
+
+--- 情況一：kernel ≥ 6.15（有 mctp-usb.ko）---
+
+  host 側 MCTP interface 出現後：
+  mctp address add 9 dev mctpusb0     ← host 自己的 EID
+  mctp route add 8 via mctpusb0       ← EID 8 走 USB
+  再用 mctp-ctrl 或 pldmtool 測試
+
+--- 情況二：kernel < 6.15（無 mctp-usb.ko）---
+
+  先把 mctp_usb 阻擋，讓 libusb 能拿介面：
+  rmmod mctp_usb 2>/dev/null || true
+
+  用舊方法驗證 USB 通道：
+  mctp-demux-daemon usb port_path=1-1 mode=0 -v &
+  （這只驗證通道是否暢通；MCTP 封包仍由 kernel 在 device 側處理）
+
+
+────────────────────────────────
+Stage 5：搭配 pldmd 端對端驗證
+────────────────────────────────
+
+確認 pldmd 編譯方式（OpenBMC 預設為 transport-af-mctp）：
+  pldmd --version
+  strings /usr/bin/pldmd | grep transport
+
+在 guest 啟動 pldmd（BMC 扮演 PLDM responder）：
+  pldmd &
+
+從 host 側發 PLDM 請求：
+  pldmtool raw -d 8 -m 1 -t 0 -C 0x00   ← GetPLDMTypes，目標 EID 8
+
+
+────────────────────────────────
+已知風險 / 事前確認清單
+────────────────────────────────
+
+  項目                              狀態      說明
+  --------------------------------  --------  -----------------------------------
+  CONFIG_MCTP_SERIAL=y              未確認    Stage 0 必查；不在就先 rebuild kernel
+  kernel ≥ 6.15（mctp-usb.ko）     未確認    影響 Stage 4 host 側方案選擇
+  phosphor-mctp 在 image 內         未確認    有的話 EID 自動；沒有就手動 add
+  pldmd 以 transport-af-mctp 編譯   通常是    OpenBMC 預設，仍需確認
+
+
+────────────────────────────────
+建議執行順序
+────────────────────────────────
+
+  Stage 0 → 確認 CONFIG_MCTP_SERIAL → 有了才繼續
+  Stage 1 → Build
+  Stage 2 → 啟動，確認 mctpserial0
+  Stage 3 → 設 MCTP 網路
+  Stage 4 → 確認 USB 通道
+  Stage 5 → pldmd 端對端
+
+  若 Stage 0 失敗，kernel config 問題優先於 code 問題，先解那個。

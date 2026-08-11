@@ -20,19 +20,46 @@ Status legend: `[ ]` not started · `[~]` in progress · `[x]` done · `[!]` blo
   earlier qemuarm64; **mctpusbd verified end-to-end on aspeed-2700** — enumerates as
   `1d6b:0104`, all four control commands answered (session log 2026-06-24). Step-5 closed.
 
-- **Next actions (for a fresh session): Option A1 — PTY + `mctp-serial` bridge**
+- **Option A1 status (2026-06-25):**
   - ~~**P0 — close step-5**~~ **DONE** (2026-06-24)
   - ~~**Step A** — message type router~~ **DONE** (2026-06-24, `bc47414`)
   - ~~**Step B** (libmctp-core binding) + **Step C** (demux socket server)~~
     **DISCARDED** (2026-06-25, `0753217`) — wrong direction; see
     [`ARCH-TRANSPORT.md`](./ARCH-TRANSPORT.md)
-  - **Option A1 — next:** PTY + `mctp-serial` line discipline bridge to kernel MCTP stack
-    - First gate: confirm `CONFIG_MCTP_SERIAL` on aspeed-2700 kernel
-    - Open `/dev/ptmx`; attach `N_MCTP` line discipline via `ioctl(pty_slave_fd, TIOCSETD, &N_MCTP)`
-    - DSP0253 framing encode/decode in mctpusbd
-    - Bridge loop: ep-OUT → strip USB header → DSP0253 frame → write PTY master
-    - TX path: read PTY master → strip DSP0253 → add USB header → write ep-IN
-  - Full architecture and data flow: [`ARCH-TRANSPORT.md`](./ARCH-TRANSPORT.md)
+  - ~~**Option A1 implementation**~~ **DONE** (2026-06-25) — C17 rewrite; PTY + N_MCTP
+    bridge implemented in `ffs_daemon.c` (`FFS_MODE_PTY_BRIDGE`). New files:
+    `mctp/mctp_serial_frame.{h,c}` (DSP0253 framing), `ffs/ffs_pty.{h,c}` (PTY open
+    + N_MCTP attach). 18/18 unit tests pass.
+
+- **Next actions — bridge interface refactor (A1/A2 compile-flag switching)**
+
+  **Goal:** extract the bridge backend from `ffs_daemon.c` into a stable interface
+  (`ffs_bridge.h`) so that A1 (PTY + mctp-serial) and A2 (kernel module chardev) can
+  coexist in the same source tree and be selected at compile time via a meson option.
+  A1 is **not** a throwaway — it is a permanent backend for environments without the
+  kernel module. Design fully specified in [`DESIGN-BRIDGE.md`](./DESIGN-BRIDGE.md).
+
+  - [ ] Add `meson_options.txt` with `option('bridge', choices: ['a1', 'a2'], value: 'a1')`
+  - [ ] Create `ffs/ffs_bridge.h` — declare 4-function interface:
+        `ffs_bridge_open`, `ffs_bridge_handle_out`, `ffs_bridge_handle_in`, `ffs_bridge_close`
+  - [ ] Create `ffs/ffs_bridge_a1.c` — move PTY bridge logic out of `ffs_daemon.c`
+        (state machine, DSP0253 encode/decode, PTY open); implement the 4 functions
+  - [ ] Refactor `ffs_daemon.c` to call through `ffs_bridge.h`; rename
+        `FFS_MODE_PTY_BRIDGE` → `FFS_MODE_BRIDGE`; zero `#ifdef` in `ffs_daemon.c`
+  - [ ] Update `meson.build` to select `ffs_bridge_a1.c` vs `ffs_bridge_a2.c` based on option
+  - [ ] Gate: `meson setup build -Dbridge=a1 && ninja && meson test` — 18/18 pass,
+        behaviour identical to current A1
+
+  See [`DESIGN-BRIDGE.md §7–§8`](./DESIGN-BRIDGE.md) for step-by-step refactor guide.
+
+- **Future: A2 kernel module** (after bridge interface is in place)
+  - [ ] Write `mctp_gadget.ko` (~300 lines) — ARPHRD_MCTP net device + char device
+  - [ ] Write `ffs/ffs_bridge_a2.c` (~50 lines) — open `/dev/mctp-gadget`, raw MCTP r/w
+  - [ ] `meson setup build-a2 -Dbridge=a2` selects A2 backend; A1 source unchanged
+  - See [`DESIGN-BRIDGE.md §9`](./DESIGN-BRIDGE.md) for kernel module skeleton
+
+  Architecture and rationale: [`ARCH-TRANSPORT.md`](./ARCH-TRANSPORT.md),
+  [`DESIGN-BRIDGE.md`](./DESIGN-BRIDGE.md)
 
 ## Next phase: libusbgx migration — steps 1–4 DONE, step 5 (guest verify) pending
 
@@ -474,6 +501,36 @@ shortcut a fuller implementation would tighten; the other two are correct as-is.
 ## Session log
 
 > Append newest entries at the top. Format: `### YYYY-MM-DD — summary`
+
+### 2026-06-25 — A1 implementation done; bridge interface design (A1/A2 compile-flag switching) established
+
+**A1 implementation (C17).** PTY + N_MCTP bridge complete. New files:
+- `mctp/mctp_serial_frame.{h,c}` — DSP0253 encode/decode, CRC-16/CCITT-FALSE
+- `ffs/ffs_pty.{h,c}` — open `/dev/ptmx`, attach N_MCTP line discipline (`TIOCSETD`)
+- `ffs_daemon.c` — added `FFS_MODE_PTY_BRIDGE` with 7-state rx state machine and
+  slot-based poll loop (ep0 + ep_out + pty_master); `ffs_serve()` gains `pty_master_fd` param
+- `mctpusbd.c` — defaults to `FFS_MODE_PTY_BRIDGE`; opens PTY, passes both fds to lifecycle
+- `ffsd.c` — unchanged in behaviour; passes `-1` for pty_master_fd
+
+18/18 unit tests pass (no regression). A1 implementation is embedded in `ffs_daemon.c`
+(not yet behind the bridge interface abstraction — that is the next step).
+
+**Bridge interface design (`DESIGN-BRIDGE.md` created).** Key decisions:
+- A1 is a **permanent backend**, not a throwaway. Rationale: works without a kernel module
+  (requires only `CONFIG_MCTP_SERIAL=y`); remains the preferred backend for standard
+  OpenBMC images. A2 adds better performance but A1 is not removed.
+- Bridge backend is the **only** thing that differs between A1 and A2. Everything else
+  (`ffs_daemon.c`, USB header handling, gadget lifecycle) is identical.
+- Interface: 4 functions — `ffs_bridge_open`, `ffs_bridge_handle_out`,
+  `ffs_bridge_handle_in`, `ffs_bridge_close`. `ffs_daemon.c` calls through this
+  interface with zero `#ifdef`.
+- Meson option `bridge` (`a1` / `a2`) selects which `.c` file is compiled.
+  `meson setup build -Dbridge=a1` / `-Dbridge=a2`. Default: `a1`.
+- A1 source (`ffs_bridge_a1.c`) and A2 source (`ffs_bridge_a2.c`) coexist in the tree.
+
+**Next immediate step:** refactor — extract A1 bridge logic from `ffs_daemon.c` into
+`ffs/ffs_bridge_a1.c` implementing the `ffs_bridge.h` interface. No behaviour change.
+Checklist in PROGRESS.md "Current focus" section.
 
 ### 2026-06-25 — architectural review: demux socket path has a dual-role ceiling; kernel MCTP stack is the target direction
 

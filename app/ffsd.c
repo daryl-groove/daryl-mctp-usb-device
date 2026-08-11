@@ -40,5 +40,5 @@ int main(int argc, char **argv)
 	}
 
 	/* No on_ready: gadget.sh binds the UDC after descriptors are written. */
-	return ffs_serve(mount, mode, NULL, NULL);
+	return ffs_serve(mount, mode, -1, NULL, NULL);
 }

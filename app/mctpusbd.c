@@ -1,4 +1,5 @@
 #include "ffs_daemon.h"
+#include "ffs_pty.h"
 
 #include <errno.h>
 #include <signal.h>
@@ -11,11 +12,11 @@
 #include <usbg/usbg.h>
 
 /*
- * mctpusbd — self-contained MCTP-over-USB gadget daemon.
- * Creates the USB gadget via libusbgx, mounts FunctionFS, runs the event loop,
- * and cleans up on SIGINT/SIGTERM.
+ * mctpusbd — MCTP-over-USB gadget daemon (Option A1: PTY + mctp-serial bridge).
+ * Creates the USB gadget via libusbgx, mounts FunctionFS, opens a PTY, attaches
+ * N_MCTP line discipline, and bridges USB bulk transfers ↔ PTY master fd.
  *
- *   --echo          : raw loopback mode
+ *   --echo          : raw loopback mode (for hardware testing)
  *   --udc <name>    : bind to a named UDC (default: auto-pick first)
  *   <mountpoint>    : FunctionFS mount path (default: /dev/ffs-mctp)
  */
@@ -88,7 +89,7 @@ typedef struct {
 
 static int parse_args(int argc, char **argv, options_t *opt)
 {
-	opt->mode     = FFS_MODE_MCTP;
+	opt->mode     = FFS_MODE_PTY_BRIDGE;
 	opt->udc_name = NULL;
 	opt->mount    = "/dev/ffs-mctp";
 
@@ -123,12 +124,14 @@ int main(int argc, char **argv)
 
 	install_signal_handlers();
 
-	usbg_state   *s = NULL;
-	usbg_gadget  *g = NULL;
+	usbg_state    *s = NULL;
+	usbg_gadget   *g = NULL;
 	usbg_function *f = NULL;
 	usbg_config   *c = NULL;
-	int mounted = 0;
-	int rc = 1;
+	int mounted     = 0;
+	int pty_master  = -1;
+	int pty_slave   = -1;
+	int rc          = 1;
 
 	if (usbg_check(usbg_init(CONFIGFS_PATH, &s), "usbg_init") < 0)
 		return 1;
@@ -176,10 +179,18 @@ int main(int argc, char **argv)
 	printf("gadget '%s' created; functionfs mounted at %s\n",
 	       GADGET_NAME, opt.mount);
 
+	if (opt.mode == FFS_MODE_PTY_BRIDGE) {
+		if (ffs_pty_open(&pty_master, &pty_slave) < 0)
+			goto cleanup;
+	}
+
 	on_ready_ctx_t ready_ctx = { g, opt.udc_name, s };
-	rc = ffs_serve(opt.mount, opt.mode, on_ready_enable_udc, &ready_ctx);
+	rc = ffs_serve(opt.mount, opt.mode, pty_master,
+	               on_ready_enable_udc, &ready_ctx);
 
 cleanup:
+	if (pty_slave  >= 0) close(pty_slave);
+	if (pty_master >= 0) close(pty_master);
 	if (g) usbg_disable_gadget(g);
 	if (mounted && umount(opt.mount) != 0)
 		fprintf(stderr, "umount %s failed: %s\n", opt.mount, strerror(errno));

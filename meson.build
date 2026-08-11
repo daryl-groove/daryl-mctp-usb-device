@@ -14,11 +14,13 @@ mctp_sources = files(
   'mctp/mctp_packet.c',
   'mctp/mctp_control.c',
   'mctp/mctp_endpoint.c',
+  'mctp/mctp_serial_frame.c',
 )
 
 # ── FunctionFS event loop ─────────────────────────────────────────────────────
 ffs_sources = files(
   'ffs/ffs_daemon.c',
+  'ffs/ffs_pty.c',
 )
 
 # Shared engine library (static, reused by both binaries and tests).
